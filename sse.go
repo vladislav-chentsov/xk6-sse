@@ -119,7 +119,7 @@ func (mi *sse) Open(url string, args ...sobek.Value) (*HTTPResponse, error) {
 
 	if !strings.Contains(client.resp.Header.Get("Content-Type"), "text/event-stream") {
 		// Non-SSE response, wrap it and return immediately
-		return client.wrapHTTPResponse("")
+		return client.wrapHTTPResponse(""), nil
 	}
 
 	// Run the user-provided set up function
@@ -449,7 +449,7 @@ func (c *Client) wrapHTTPResponse(errMessage string) *HTTPResponse {
 		if err != nil {
 			bodyBytes = []byte("Error reading body: " + err.Error())
 		}
-		return &HTTPResponse{Error: errMessage, Body: string(bodyBytes)}, nil
+		return &HTTPResponse{Error: errMessage, Body: string(bodyBytes)}
 	}
 	sseResponse := HTTPResponse{
 		URL:    c.url,
@@ -465,12 +465,12 @@ func (c *Client) wrapHTTPResponse(errMessage string) *HTTPResponse {
 	if !strings.Contains(c.resp.Header.Get("Content-Type"), "text/event-stream") {
 		bodyBytes, err := io.ReadAll(c.resp.Body)
 		if err != nil {
-			return nil, err
+			return nil
 		}
 		sseResponse.Body = string(bodyBytes)
 	}
 
-	return &sseResponse, nil
+	return &sseResponse
 }
 
 func parseConnectArgs(state *lib.State, rt *sobek.Runtime, args ...sobek.Value) (*sseOpenArgs, error) {
