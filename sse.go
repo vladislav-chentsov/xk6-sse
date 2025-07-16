@@ -77,12 +77,13 @@ type Event struct {
 }
 
 type sseOpenArgs struct {
-	setupFn     sobek.Callable
-	headers     http.Header
-	method      string
-	body        string
-	cookieJar   *cookiejar.Jar
-	tagsAndMeta *metrics.TagsAndMeta
+	setupFn      sobek.Callable
+	headers      http.Header
+	method       string
+	body         string
+	cookieJar    *cookiejar.Jar
+	tagsAndMeta  *metrics.TagsAndMeta
+	streamFormat string
 }
 
 // Exports returns the exports of the sse module.
@@ -134,6 +135,14 @@ func (mi *sse) Open(url string, args ...sobek.Value) (*HTTPResponse, error) {
 	readEventChan := make(chan Event)
 	readErrChan := make(chan error)
 	readCloseChan := make(chan int)
+
+	// Choose parser based on streamFormat
+	switch parsedArgs.streamFormat {
+	case "bedrock":
+		go client.readBedrockEvents(readEventChan, readErrChan, readCloseChan)
+	default:
+		go client.readEvents(readEventChan, readErrChan, readCloseChan) // Original SSE
+	}
 
 	// Wraps a couple of channels
 	go client.readEvents(readEventChan, readErrChan, readCloseChan)
@@ -441,6 +450,134 @@ func (c *Client) readEvents(readChan chan Event, errorChan chan error, closeChan
 	}
 }
 
+// Add this method to handle Bedrock's specific format
+func (c *Client) readBedrockEvents(readChan chan Event, errorChan chan error, closeChan chan int) {
+	reader := bufio.NewReader(c.resp.Body)
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				select {
+				case closeChan <- -1:
+					return
+				case <-c.done:
+					return
+				}
+			} else {
+				select {
+				case errorChan <- err:
+					return
+				case <-c.done:
+					return
+				}
+			}
+		}
+
+		lineStr := string(line)
+
+		// Skip empty lines and chunk size indicators
+		if len(strings.TrimSpace(lineStr)) == 0 {
+			continue
+		}
+
+		// Parse Bedrock event format
+		ev := c.parseBedrockEvent(lineStr)
+		if ev != nil {
+			select {
+			case readChan <- *ev:
+			case <-c.done:
+				return
+			}
+		}
+	}
+}
+
+// Helper function to parse Bedrock event format
+func (c *Client) parseBedrockEvent(line string) *Event {
+	// Handle different parts of Bedrock event format
+	var eventType, messageType, jsonData string
+
+	// Look for event-type
+	if strings.Contains(line, ":event-type") {
+		eventType = c.extractBedrockField(line, ":event-type")
+	}
+
+	// Look for message-type and JSON data
+	if strings.Contains(line, ":message-type") {
+		parts := strings.SplitN(line, ":message-type", 2)
+		if len(parts) == 2 {
+			remainder := parts[1]
+
+			// Find where JSON starts (look for opening brace)
+			jsonStart := strings.Index(remainder, "{")
+			if jsonStart != -1 {
+				messageType = strings.TrimSpace(remainder[:jsonStart])
+				jsonData = strings.TrimSpace(remainder[jsonStart:])
+
+				// Clean up any trailing chunk indicators or garbage
+				if endBrace := strings.LastIndex(jsonData, "}"); endBrace != -1 {
+					jsonData = jsonData[:endBrace+1]
+				}
+			} else {
+				messageType = strings.TrimSpace(remainder)
+			}
+		}
+	}
+
+	// Only return event if we have meaningful data
+	if eventType != "" || (messageType != "" && jsonData != "") {
+		return &Event{
+			Name: c.determineEventName(eventType, messageType, jsonData),
+			Data: jsonData,
+		}
+	}
+
+	return nil
+}
+
+// Helper to extract field values from Bedrock format
+func (c *Client) extractBedrockField(line, field string) string {
+	if idx := strings.Index(line, field); idx != -1 {
+		remainder := line[idx+len(field):]
+		// Clean up any non-printable characters
+		result := strings.Map(func(r rune) rune {
+			if r >= 32 && r < 127 { // Keep printable ASCII
+				return r
+			}
+			return -1 // Remove non-printable
+		}, remainder)
+		return strings.TrimSpace(result)
+	}
+	return ""
+}
+
+// Helper to determine event name from Bedrock data
+func (c *Client) determineEventName(eventType, messageType, jsonData string) string {
+	if eventType != "" {
+		return eventType
+	}
+
+	if messageType != "" {
+		return messageType
+	}
+
+	// Try to determine from JSON content
+	if jsonData != "" {
+		if strings.Contains(jsonData, "contentBlockDelta") {
+			return "contentBlockDelta"
+		}
+		if strings.Contains(jsonData, "messageStart") {
+			return "messageStart"
+		}
+		if strings.Contains(jsonData, "messageStop") {
+			return "messageStop"
+		}
+	}
+
+	return "message"
+}
+
 func isLineEnd(line []byte) bool {
 	return bytes.Equal(line, []byte("\n")) || bytes.Equal(line, []byte("\r\n"))
 }
@@ -500,10 +637,11 @@ func parseConnectArgs(state *lib.State, rt *sobek.Runtime, args ...sobek.Value) 
 	headers.Set("User-Agent", state.Options.UserAgent.String)
 	tagsAndMeta := state.Tags.GetCurrentValues()
 	parsedArgs := &sseOpenArgs{
-		setupFn:     setupFn,
-		headers:     headers,
-		cookieJar:   state.CookieJar,
-		tagsAndMeta: &tagsAndMeta,
+		setupFn:      setupFn,
+		headers:      headers,
+		cookieJar:    state.CookieJar,
+		tagsAndMeta:  &tagsAndMeta,
+		streamFormat: "sse", // default to SSE
 	}
 
 	if sobek.IsUndefined(paramsV) || sobek.IsNull(paramsV) {
@@ -542,6 +680,11 @@ func parseConnectArgs(state *lib.State, rt *sobek.Runtime, args ...sobek.Value) 
 			parsedArgs.method = strings.TrimSpace(params.Get(k).ToString().String())
 		case "body":
 			parsedArgs.body = strings.TrimSpace(params.Get(k).ToString().String())
+		case "streamFormat":
+			format := params.Get(k).String()
+			if format == "bedrock" || format == "json" {
+				parsedArgs.streamFormat = format
+			}
 		}
 	}
 
