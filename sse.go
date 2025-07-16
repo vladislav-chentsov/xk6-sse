@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -118,7 +119,8 @@ func (mi *sse) Open(url string, args ...sobek.Value) (*HTTPResponse, error) {
 		return client.wrapHTTPResponse(err.Error()), nil
 	}
 
-	if !strings.Contains(client.resp.Header.Get("Content-Type"), "text/event-stream") {
+	if !strings.Contains(client.resp.Header.Get("Content-Type"), "text/event-stream") &&
+		parsedArgs.streamFormat != "bedrock" {
 		// Non-SSE response, wrap it and return immediately
 		return client.wrapHTTPResponse(""), nil
 	}
@@ -139,19 +141,18 @@ func (mi *sse) Open(url string, args ...sobek.Value) (*HTTPResponse, error) {
 	// Choose parser based on streamFormat
 	switch parsedArgs.streamFormat {
 	case "bedrock":
+		fmt.Println("DEBUG: Starting Bedrock event reader")
 		go client.readBedrockEvents(readEventChan, readErrChan, readCloseChan)
 	default:
 		go client.readEvents(readEventChan, readErrChan, readCloseChan) // Original SSE
 	}
 
-	// Wraps a couple of channels
-	go client.readEvents(readEventChan, readErrChan, readCloseChan)
-
-	// This is the main control loop. All JS code (including error handlers)
-	// should only be executed by this thread to avoid race conditions
+	// In the Open function, in the main event loop:
 	for {
 		select {
 		case event := <-readEventChan:
+			fmt.Printf("DEBUG: Event received in main loop: %+v\n", event)
+
 			metrics.PushIfNotDone(ctx, client.samplesOutput, metrics.Sample{
 				TimeSeries: metrics.TimeSeries{
 					Metric: client.sseMetrics.SSEEventReceived,
@@ -165,18 +166,19 @@ func (mi *sse) Open(url string, args ...sobek.Value) (*HTTPResponse, error) {
 			client.handleEvent("event", rt.ToValue(event))
 
 		case readErr := <-readErrChan:
+			fmt.Printf("DEBUG: Error received in main loop: %v\n", readErr)
 			client.handleEvent("error", rt.ToValue(readErr))
 
 		case <-ctx.Done():
-			// VU is shutting down during an interrupt
-			// client events will not be forwarded to the VU
+			fmt.Println("DEBUG: Context done in main loop")
 			_ = client.closeResponseBody()
 
 		case <-readCloseChan:
+			fmt.Println("DEBUG: Read close channel in main loop")
 			_ = client.closeResponseBody()
 
 		case <-client.done:
-			// This is the final exit point normally triggered by closeResponseBody
+			fmt.Println("DEBUG: Client done in main loop - returning response")
 			return client.wrapHTTPResponse(""), nil
 		}
 	}
@@ -450,14 +452,25 @@ func (c *Client) readEvents(readChan chan Event, errorChan chan error, closeChan
 	}
 }
 
-// Add this method to handle Bedrock's specific format
 func (c *Client) readBedrockEvents(readChan chan Event, errorChan chan error, closeChan chan int) {
+	fmt.Println("DEBUG: readBedrockEvents started")
+
 	reader := bufio.NewReader(c.resp.Body)
+	lineCount := 0
+	var buffer bytes.Buffer
 
 	for {
-		line, err := reader.ReadBytes('\n')
+		// Read more data into buffer
+		chunk := make([]byte, 4096)
+		n, err := reader.Read(chunk)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				fmt.Printf("DEBUG: EOF reached after %d lines\n", lineCount)
+				// Process any remaining data in buffer
+				if buffer.Len() > 0 {
+					remaining := buffer.Bytes()
+					c.processBedrockBuffer(remaining, readChan, &lineCount)
+				}
 				select {
 				case closeChan <- -1:
 					return
@@ -465,6 +478,7 @@ func (c *Client) readBedrockEvents(readChan chan Event, errorChan chan error, cl
 					return
 				}
 			} else {
+				fmt.Printf("DEBUG: Read error after %d lines: %v\n", lineCount, err)
 				select {
 				case errorChan <- err:
 					return
@@ -474,108 +488,286 @@ func (c *Client) readBedrockEvents(readChan chan Event, errorChan chan error, cl
 			}
 		}
 
-		lineStr := string(line)
+		buffer.Write(chunk[:n])
+		fmt.Printf("DEBUG: Buffer size after read: %d bytes\n", buffer.Len())
 
-		// Skip empty lines and chunk size indicators
-		if len(strings.TrimSpace(lineStr)) == 0 {
+		// Process complete events from buffer and keep unprocessed data
+		remaining := c.processBedrockBuffer(buffer.Bytes(), readChan, &lineCount)
+
+		// Reset buffer and keep only unprocessed data
+		buffer.Reset()
+		if len(remaining) > 0 {
+			buffer.Write(remaining)
+		}
+	}
+}
+
+// Helper function to detect complete events in the binary stream
+func (c *Client) hasCompleteEvent(data []byte) bool {
+	// Look for the pattern that indicates a complete event
+	// Based on your output, events seem to contain JSON objects
+	dataStr := string(data)
+
+	// Check if we have a JSON object
+	if strings.Contains(dataStr, "{") && strings.Contains(dataStr, "}") {
+		// Count braces to ensure we have a complete JSON object
+		openBraces := strings.Count(dataStr, "{")
+		closeBraces := strings.Count(dataStr, "}")
+		if openBraces > 0 && openBraces == closeBraces {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (c *Client) processBedrockBuffer(data []byte, readChan chan Event, lineCount *int) []byte {
+	dataStr := string(data)
+
+	// Find all event boundaries
+	eventBoundaries, remainingData := c.findEventBoundariesWithRemainder(dataStr)
+
+	fmt.Printf("DEBUG: Found %d events in buffer\n", len(eventBoundaries))
+
+	for _, eventData := range eventBoundaries {
+		if eventData == "" {
 			continue
 		}
 
-		// Parse Bedrock event format
-		ev := c.parseBedrockEvent(lineStr)
+		*lineCount++
+		fmt.Printf("DEBUG: Processing event %d: %q\n", *lineCount, eventData[:min(200, len(eventData))])
+
+		ev := c.parseBedrockEvent(eventData)
 		if ev != nil {
+			fmt.Printf("DEBUG: Sending event %d: %+v\n", *lineCount, ev)
 			select {
 			case readChan <- *ev:
+				fmt.Printf("DEBUG: Event sent successfully\n")
 			case <-c.done:
-				return
+				fmt.Printf("DEBUG: Client done while sending event\n")
+				return []byte(remainingData)
 			}
 		}
 	}
+
+	return []byte(remainingData)
 }
 
-// Helper function to parse Bedrock event format
+func (c *Client) findEventBoundaries(data string) []string {
+	var events []string
+
+	// Look for the pattern ":event-type" which seems to mark the start of events
+	eventMarker := ":event-type"
+	lastIndex := 0
+
+	for {
+		index := strings.Index(data[lastIndex:], eventMarker)
+		if index == -1 {
+			break
+		}
+
+		index += lastIndex
+
+		// If this is not the first event, add the previous event
+		if lastIndex > 0 {
+			eventData := data[lastIndex:index]
+			if len(strings.TrimSpace(eventData)) > 0 {
+				events = append(events, eventData)
+			}
+		}
+
+		lastIndex = index
+	}
+
+	// Add the last event
+	if lastIndex < len(data) {
+		eventData := data[lastIndex:]
+		if len(strings.TrimSpace(eventData)) > 0 {
+			events = append(events, eventData)
+		}
+	}
+
+	return events
+}
+
+func (c *Client) findEventBoundariesWithRemainder(data string) ([]string, string) {
+	var events []string
+	eventMarker := ":event-type"
+	indices := []int{}
+
+	// Find all positions of event markers
+	searchStart := 0
+	for {
+		index := strings.Index(data[searchStart:], eventMarker)
+		if index == -1 {
+			break
+		}
+		indices = append(indices, searchStart+index)
+		searchStart = searchStart + index + len(eventMarker)
+	}
+
+	fmt.Printf("DEBUG: Found %d event markers at positions: %v\n", len(indices), indices)
+
+	if len(indices) == 0 {
+		// No complete events found, return all data as remainder
+		return []string{}, data
+	}
+
+	// Extract complete events
+	for i := 0; i < len(indices)-1; i++ {
+		eventData := data[indices[i]:indices[i+1]]
+		if len(strings.TrimSpace(eventData)) > 0 {
+			events = append(events, eventData)
+		}
+	}
+
+	// Handle the last event - it might be incomplete
+	lastEventStart := indices[len(indices)-1]
+	lastEventData := data[lastEventStart:]
+
+	// Check if the last event is complete by looking for a closing brace after the JSON
+	if c.isEventComplete(lastEventData) {
+		events = append(events, lastEventData)
+		return events, ""
+	} else {
+		// Last event is incomplete, return it as remainder
+		return events, lastEventData
+	}
+}
+
+func (c *Client) isEventComplete(eventData string) bool {
+	// Clean the data first
+	cleanData := strings.Map(func(r rune) rune {
+		if r >= 32 && r <= 126 { // Printable ASCII
+			return r
+		}
+		if r >= 0x80 { // Allow UTF-8 characters
+			return r
+		}
+		return ' '
+	}, eventData)
+
+	// Look for JSON start
+	jsonStart := strings.Index(cleanData, "{")
+	if jsonStart == -1 {
+		return false
+	}
+
+	// Check if we have a complete JSON object
+	jsonData := c.extractCompleteJSON(cleanData[jsonStart:])
+	return jsonData != ""
+}
+
 func (c *Client) parseBedrockEvent(line string) *Event {
-	// Handle different parts of Bedrock event format
-	var eventType, messageType, jsonData string
+	// Clean the line first
+	cleanLine := strings.Map(func(r rune) rune {
+		if r >= 32 && r <= 126 { // Printable ASCII
+			return r
+		}
+		if r >= 0x80 { // Allow UTF-8 characters
+			return r
+		}
+		return ' ' // Replace non-printable with space
+	}, line)
 
-	// Look for event-type
-	if strings.Contains(line, ":event-type") {
-		eventType = c.extractBedrockField(line, ":event-type")
+	// Remove extra spaces
+	cleanLine = strings.Join(strings.Fields(cleanLine), " ")
+
+	fmt.Printf("DEBUG: Clean line: %q\n", cleanLine)
+
+	// Extract event type
+	eventType := ""
+	if strings.Contains(cleanLine, "contentBlockDelta") {
+		eventType = "contentBlockDelta"
+	} else if strings.Contains(cleanLine, "messageStart") {
+		eventType = "messageStart"
+	} else if strings.Contains(cleanLine, "messageStop") {
+		eventType = "messageStop"
+	} else if strings.Contains(cleanLine, "contentBlockStop") {
+		eventType = "contentBlockStop"
+	} else if strings.Contains(cleanLine, "metadata") {
+		eventType = "metadata"
 	}
 
-	// Look for message-type and JSON data
-	if strings.Contains(line, ":message-type") {
-		parts := strings.SplitN(line, ":message-type", 2)
-		if len(parts) == 2 {
-			remainder := parts[1]
+	// Extract JSON data more carefully
+	jsonStart := strings.Index(cleanLine, "{")
+	if jsonStart == -1 {
+		return nil
+	}
 
-			// Find where JSON starts (look for opening brace)
-			jsonStart := strings.Index(remainder, "{")
-			if jsonStart != -1 {
-				messageType = strings.TrimSpace(remainder[:jsonStart])
-				jsonData = strings.TrimSpace(remainder[jsonStart:])
+	// Find the complete JSON object by counting braces
+	jsonData := c.extractCompleteJSON(cleanLine[jsonStart:])
 
-				// Clean up any trailing chunk indicators or garbage
-				if endBrace := strings.LastIndex(jsonData, "}"); endBrace != -1 {
-					jsonData = jsonData[:endBrace+1]
+	if jsonData == "" {
+		return nil
+	}
+
+	fmt.Printf("DEBUG: Extracted JSON: %q\n", jsonData)
+
+	// Validate JSON
+	var testJson map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonData), &testJson); err != nil {
+		fmt.Printf("DEBUG: Invalid JSON: %v\n", err)
+		return nil
+	}
+
+	// Determine event type from JSON if not found
+	if eventType == "" {
+		if _, ok := testJson["delta"]; ok {
+			eventType = "contentBlockDelta"
+		} else if _, ok := testJson["role"]; ok {
+			eventType = "messageStart"
+		} else if _, ok := testJson["stopReason"]; ok {
+			eventType = "messageStop"
+		} else if _, ok := testJson["metrics"]; ok {
+			eventType = "metadata"
+		} else {
+			eventType = "message"
+		}
+	}
+
+	fmt.Printf("DEBUG: Determined event type: %s\n", eventType)
+
+	return &Event{
+		Name: eventType,
+		Data: jsonData,
+	}
+}
+
+func (c *Client) extractCompleteJSON(data string) string {
+	braceCount := 0
+	inString := false
+	escaped := false
+
+	for i, char := range data {
+		if escaped {
+			escaped = false
+			continue
+		}
+
+		if char == '\\' {
+			escaped = true
+			continue
+		}
+
+		if char == '"' {
+			inString = !inString
+			continue
+		}
+
+		if !inString {
+			if char == '{' {
+				braceCount++
+			} else if char == '}' {
+				braceCount--
+				if braceCount == 0 {
+					return data[:i+1]
 				}
-			} else {
-				messageType = strings.TrimSpace(remainder)
 			}
 		}
 	}
 
-	// Only return event if we have meaningful data
-	if eventType != "" || (messageType != "" && jsonData != "") {
-		return &Event{
-			Name: c.determineEventName(eventType, messageType, jsonData),
-			Data: jsonData,
-		}
-	}
-
-	return nil
-}
-
-// Helper to extract field values from Bedrock format
-func (c *Client) extractBedrockField(line, field string) string {
-	if idx := strings.Index(line, field); idx != -1 {
-		remainder := line[idx+len(field):]
-		// Clean up any non-printable characters
-		result := strings.Map(func(r rune) rune {
-			if r >= 32 && r < 127 { // Keep printable ASCII
-				return r
-			}
-			return -1 // Remove non-printable
-		}, remainder)
-		return strings.TrimSpace(result)
-	}
 	return ""
-}
-
-// Helper to determine event name from Bedrock data
-func (c *Client) determineEventName(eventType, messageType, jsonData string) string {
-	if eventType != "" {
-		return eventType
-	}
-
-	if messageType != "" {
-		return messageType
-	}
-
-	// Try to determine from JSON content
-	if jsonData != "" {
-		if strings.Contains(jsonData, "contentBlockDelta") {
-			return "contentBlockDelta"
-		}
-		if strings.Contains(jsonData, "messageStart") {
-			return "messageStart"
-		}
-		if strings.Contains(jsonData, "messageStop") {
-			return "messageStop"
-		}
-	}
-
-	return "message"
 }
 
 func isLineEnd(line []byte) bool {
@@ -584,34 +776,28 @@ func isLineEnd(line []byte) bool {
 
 // Wrap the raw HTTPResponse we received to a sse.HTTPResponse we can pass to the user
 func (c *Client) wrapHTTPResponse(errMessage string) *HTTPResponse {
+	sseResponse := &HTTPResponse{}
+
 	if errMessage != "" {
-		// Read the response body if available.
-		bodyBytes, err := io.ReadAll(c.resp.Body)
-		if err != nil {
-			bodyBytes = []byte("Error reading body: " + err.Error())
-		}
-		return &HTTPResponse{Error: errMessage, Body: string(bodyBytes)}
-	}
-	sseResponse := HTTPResponse{
-		URL:    c.url,
-		Status: c.resp.StatusCode,
+		sseResponse.Error = errMessage
+		return sseResponse
 	}
 
+	// Make sure we have a valid response
+	if c.resp == nil {
+		sseResponse.Error = "No HTTP response available"
+		return sseResponse
+	}
+
+	sseResponse.URL = c.url
+	sseResponse.Status = c.resp.StatusCode
 	sseResponse.Headers = make(map[string]string, len(c.resp.Header))
+
 	for k, vs := range c.resp.Header {
 		sseResponse.Headers[k] = strings.Join(vs, ", ")
 	}
 
-	// Only read the body if the content type is not `text/event-stream`.
-	if !strings.Contains(c.resp.Header.Get("Content-Type"), "text/event-stream") {
-		bodyBytes, err := io.ReadAll(c.resp.Body)
-		if err != nil {
-			return nil
-		}
-		sseResponse.Body = string(bodyBytes)
-	}
-
-	return &sseResponse
+	return sseResponse
 }
 
 func parseConnectArgs(state *lib.State, rt *sobek.Runtime, args ...sobek.Value) (*sseOpenArgs, error) {
@@ -688,6 +874,7 @@ func parseConnectArgs(state *lib.State, rt *sobek.Runtime, args ...sobek.Value) 
 		}
 	}
 
+	fmt.Printf("DEBUG: Final streamFormat: %s\n", parsedArgs.streamFormat)
 	return parsedArgs, nil
 }
 
