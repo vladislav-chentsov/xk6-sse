@@ -65,7 +65,6 @@ type HTTPResponse struct {
 	URL     string            `json:"url"`
 	Status  int               `json:"status"`
 	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body"`
 	Error   string            `json:"error"`
 }
 
@@ -139,20 +138,16 @@ func (mi *sse) Open(url string, args ...sobek.Value) (*HTTPResponse, error) {
 	readCloseChan := make(chan int)
 
 	// Choose parser based on streamFormat
-	switch parsedArgs.streamFormat {
-	case "bedrock":
-		fmt.Println("DEBUG: Starting Bedrock event reader")
+	if parsedArgs.streamFormat == "bedrock" {
 		go client.readBedrockEvents(readEventChan, readErrChan, readCloseChan)
-	default:
-		go client.readEvents(readEventChan, readErrChan, readCloseChan) // Original SSE
+	} else {
+		go client.readEvents(readEventChan, readErrChan, readCloseChan)
 	}
 
-	// In the Open function, in the main event loop:
+	// Main event loop
 	for {
 		select {
 		case event := <-readEventChan:
-			fmt.Printf("DEBUG: Event received in main loop: %+v\n", event)
-
 			metrics.PushIfNotDone(ctx, client.samplesOutput, metrics.Sample{
 				TimeSeries: metrics.TimeSeries{
 					Metric: client.sseMetrics.SSEEventReceived,
@@ -166,19 +161,15 @@ func (mi *sse) Open(url string, args ...sobek.Value) (*HTTPResponse, error) {
 			client.handleEvent("event", rt.ToValue(event))
 
 		case readErr := <-readErrChan:
-			fmt.Printf("DEBUG: Error received in main loop: %v\n", readErr)
 			client.handleEvent("error", rt.ToValue(readErr))
 
 		case <-ctx.Done():
-			fmt.Println("DEBUG: Context done in main loop")
 			_ = client.closeResponseBody()
 
 		case <-readCloseChan:
-			fmt.Println("DEBUG: Read close channel in main loop")
 			_ = client.closeResponseBody()
 
 		case <-client.done:
-			fmt.Println("DEBUG: Client done in main loop - returning response")
 			return client.wrapHTTPResponse(""), nil
 		}
 	}
@@ -452,11 +443,9 @@ func (c *Client) readEvents(readChan chan Event, errorChan chan error, closeChan
 	}
 }
 
+// Handle AWS Bedrock's binary event stream format
 func (c *Client) readBedrockEvents(readChan chan Event, errorChan chan error, closeChan chan int) {
-	fmt.Println("DEBUG: readBedrockEvents started")
-
 	reader := bufio.NewReader(c.resp.Body)
-	lineCount := 0
 	var buffer bytes.Buffer
 
 	for {
@@ -465,11 +454,8 @@ func (c *Client) readBedrockEvents(readChan chan Event, errorChan chan error, cl
 		n, err := reader.Read(chunk)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				fmt.Printf("DEBUG: EOF reached after %d lines\n", lineCount)
-				// Process any remaining data in buffer
 				if buffer.Len() > 0 {
-					remaining := buffer.Bytes()
-					c.processBedrockBuffer(remaining, readChan, &lineCount)
+					c.processBedrockBuffer(buffer.Bytes(), readChan)
 				}
 				select {
 				case closeChan <- -1:
@@ -478,7 +464,6 @@ func (c *Client) readBedrockEvents(readChan chan Event, errorChan chan error, cl
 					return
 				}
 			} else {
-				fmt.Printf("DEBUG: Read error after %d lines: %v\n", lineCount, err)
 				select {
 				case errorChan <- err:
 					return
@@ -489,12 +474,7 @@ func (c *Client) readBedrockEvents(readChan chan Event, errorChan chan error, cl
 		}
 
 		buffer.Write(chunk[:n])
-		fmt.Printf("DEBUG: Buffer size after read: %d bytes\n", buffer.Len())
-
-		// Process complete events from buffer and keep unprocessed data
-		remaining := c.processBedrockBuffer(buffer.Bytes(), readChan, &lineCount)
-
-		// Reset buffer and keep only unprocessed data
+		remaining := c.processBedrockBuffer(buffer.Bytes(), readChan)
 		buffer.Reset()
 		if len(remaining) > 0 {
 			buffer.Write(remaining)
@@ -502,231 +482,91 @@ func (c *Client) readBedrockEvents(readChan chan Event, errorChan chan error, cl
 	}
 }
 
-// Helper function to detect complete events in the binary stream
-func (c *Client) hasCompleteEvent(data []byte) bool {
-	// Look for the pattern that indicates a complete event
-	// Based on your output, events seem to contain JSON objects
+func (c *Client) processBedrockBuffer(data []byte, readChan chan Event) []byte {
 	dataStr := string(data)
+	events, remaining := c.findBedrockEvents(dataStr)
 
-	// Check if we have a JSON object
-	if strings.Contains(dataStr, "{") && strings.Contains(dataStr, "}") {
-		// Count braces to ensure we have a complete JSON object
-		openBraces := strings.Count(dataStr, "{")
-		closeBraces := strings.Count(dataStr, "}")
-		if openBraces > 0 && openBraces == closeBraces {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (c *Client) processBedrockBuffer(data []byte, readChan chan Event, lineCount *int) []byte {
-	dataStr := string(data)
-
-	// Find all event boundaries
-	eventBoundaries, remainingData := c.findEventBoundariesWithRemainder(dataStr)
-
-	fmt.Printf("DEBUG: Found %d events in buffer\n", len(eventBoundaries))
-
-	for _, eventData := range eventBoundaries {
-		if eventData == "" {
-			continue
-		}
-
-		*lineCount++
-		fmt.Printf("DEBUG: Processing event %d: %q\n", *lineCount, eventData[:min(200, len(eventData))])
-
-		ev := c.parseBedrockEvent(eventData)
-		if ev != nil {
-			fmt.Printf("DEBUG: Sending event %d: %+v\n", *lineCount, ev)
+	for _, eventData := range events {
+		if ev := c.parseBedrockEvent(eventData); ev != nil {
 			select {
 			case readChan <- *ev:
-				fmt.Printf("DEBUG: Event sent successfully\n")
 			case <-c.done:
-				fmt.Printf("DEBUG: Client done while sending event\n")
-				return []byte(remainingData)
+				return []byte(remaining)
 			}
 		}
 	}
 
-	return []byte(remainingData)
+	return []byte(remaining)
 }
 
-func (c *Client) findEventBoundaries(data string) []string {
-	var events []string
-
-	// Look for the pattern ":event-type" which seems to mark the start of events
+func (c *Client) findBedrockEvents(data string) ([]string, string) {
 	eventMarker := ":event-type"
-	lastIndex := 0
+	var events []string
+	var indices []int
 
-	for {
-		index := strings.Index(data[lastIndex:], eventMarker)
-		if index == -1 {
+	// Find all event markers
+	for pos := 0; pos < len(data); {
+		if idx := strings.Index(data[pos:], eventMarker); idx != -1 {
+			indices = append(indices, pos+idx)
+			pos += idx + len(eventMarker)
+		} else {
 			break
 		}
-
-		index += lastIndex
-
-		// If this is not the first event, add the previous event
-		if lastIndex > 0 {
-			eventData := data[lastIndex:index]
-			if len(strings.TrimSpace(eventData)) > 0 {
-				events = append(events, eventData)
-			}
-		}
-
-		lastIndex = index
 	}
-
-	// Add the last event
-	if lastIndex < len(data) {
-		eventData := data[lastIndex:]
-		if len(strings.TrimSpace(eventData)) > 0 {
-			events = append(events, eventData)
-		}
-	}
-
-	return events
-}
-
-func (c *Client) findEventBoundariesWithRemainder(data string) ([]string, string) {
-	var events []string
-	eventMarker := ":event-type"
-	indices := []int{}
-
-	// Find all positions of event markers
-	searchStart := 0
-	for {
-		index := strings.Index(data[searchStart:], eventMarker)
-		if index == -1 {
-			break
-		}
-		indices = append(indices, searchStart+index)
-		searchStart = searchStart + index + len(eventMarker)
-	}
-
-	fmt.Printf("DEBUG: Found %d event markers at positions: %v\n", len(indices), indices)
 
 	if len(indices) == 0 {
-		// No complete events found, return all data as remainder
-		return []string{}, data
+		return nil, data
 	}
 
 	// Extract complete events
 	for i := 0; i < len(indices)-1; i++ {
 		eventData := data[indices[i]:indices[i+1]]
-		if len(strings.TrimSpace(eventData)) > 0 {
+		if strings.TrimSpace(eventData) != "" {
 			events = append(events, eventData)
 		}
 	}
 
-	// Handle the last event - it might be incomplete
-	lastEventStart := indices[len(indices)-1]
-	lastEventData := data[lastEventStart:]
-
-	// Check if the last event is complete by looking for a closing brace after the JSON
-	if c.isEventComplete(lastEventData) {
+	// Handle the last event
+	lastEventData := data[indices[len(indices)-1]:]
+	if c.isBedrockEventComplete(lastEventData) {
 		events = append(events, lastEventData)
 		return events, ""
-	} else {
-		// Last event is incomplete, return it as remainder
-		return events, lastEventData
 	}
+
+	return events, lastEventData
 }
 
-func (c *Client) isEventComplete(eventData string) bool {
-	// Clean the data first
-	cleanData := strings.Map(func(r rune) rune {
-		if r >= 32 && r <= 126 { // Printable ASCII
-			return r
-		}
-		if r >= 0x80 { // Allow UTF-8 characters
-			return r
-		}
-		return ' '
-	}, eventData)
+func (c *Client) isBedrockEventComplete(eventData string) bool {
+	cleanData := cleanNonPrintable(eventData)
+	if jsonStart := strings.Index(cleanData, "{"); jsonStart != -1 {
+		return extractCompleteJSON(cleanData[jsonStart:]) != ""
+	}
+	return false
+}
 
-	// Look for JSON start
+func (c *Client) parseBedrockEvent(eventData string) *Event {
+	cleanData := cleanNonPrintable(eventData)
+	cleanData = strings.Join(strings.Fields(cleanData), " ")
+
+	// Extract JSON
 	jsonStart := strings.Index(cleanData, "{")
-	if jsonStart == -1 {
-		return false
-	}
-
-	// Check if we have a complete JSON object
-	jsonData := c.extractCompleteJSON(cleanData[jsonStart:])
-	return jsonData != ""
-}
-
-func (c *Client) parseBedrockEvent(line string) *Event {
-	// Clean the line first
-	cleanLine := strings.Map(func(r rune) rune {
-		if r >= 32 && r <= 126 { // Printable ASCII
-			return r
-		}
-		if r >= 0x80 { // Allow UTF-8 characters
-			return r
-		}
-		return ' ' // Replace non-printable with space
-	}, line)
-
-	// Remove extra spaces
-	cleanLine = strings.Join(strings.Fields(cleanLine), " ")
-
-	fmt.Printf("DEBUG: Clean line: %q\n", cleanLine)
-
-	// Extract event type
-	eventType := ""
-	if strings.Contains(cleanLine, "contentBlockDelta") {
-		eventType = "contentBlockDelta"
-	} else if strings.Contains(cleanLine, "messageStart") {
-		eventType = "messageStart"
-	} else if strings.Contains(cleanLine, "messageStop") {
-		eventType = "messageStop"
-	} else if strings.Contains(cleanLine, "contentBlockStop") {
-		eventType = "contentBlockStop"
-	} else if strings.Contains(cleanLine, "metadata") {
-		eventType = "metadata"
-	}
-
-	// Extract JSON data more carefully
-	jsonStart := strings.Index(cleanLine, "{")
 	if jsonStart == -1 {
 		return nil
 	}
 
-	// Find the complete JSON object by counting braces
-	jsonData := c.extractCompleteJSON(cleanLine[jsonStart:])
-
+	jsonData := extractCompleteJSON(cleanData[jsonStart:])
 	if jsonData == "" {
 		return nil
 	}
 
-	fmt.Printf("DEBUG: Extracted JSON: %q\n", jsonData)
-
 	// Validate JSON
-	var testJson map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonData), &testJson); err != nil {
-		fmt.Printf("DEBUG: Invalid JSON: %v\n", err)
+	var jsonObj map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonData), &jsonObj); err != nil {
 		return nil
 	}
 
-	// Determine event type from JSON if not found
-	if eventType == "" {
-		if _, ok := testJson["delta"]; ok {
-			eventType = "contentBlockDelta"
-		} else if _, ok := testJson["role"]; ok {
-			eventType = "messageStart"
-		} else if _, ok := testJson["stopReason"]; ok {
-			eventType = "messageStop"
-		} else if _, ok := testJson["metrics"]; ok {
-			eventType = "metadata"
-		} else {
-			eventType = "message"
-		}
-	}
-
-	fmt.Printf("DEBUG: Determined event type: %s\n", eventType)
+	// Determine event type
+	eventType := determineBedrockEventType(cleanData, jsonObj)
 
 	return &Event{
 		Name: eventType,
@@ -734,7 +574,17 @@ func (c *Client) parseBedrockEvent(line string) *Event {
 	}
 }
 
-func (c *Client) extractCompleteJSON(data string) string {
+// Helper functions
+func cleanNonPrintable(data string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 32 && r <= 126) || r >= 0x80 {
+			return r
+		}
+		return ' '
+	}, data)
+}
+
+func extractCompleteJSON(data string) string {
 	braceCount := 0
 	inString := false
 	escaped := false
@@ -745,20 +595,17 @@ func (c *Client) extractCompleteJSON(data string) string {
 			continue
 		}
 
-		if char == '\\' {
+		switch char {
+		case '\\':
 			escaped = true
-			continue
-		}
-
-		if char == '"' {
+		case '"':
 			inString = !inString
-			continue
-		}
-
-		if !inString {
-			if char == '{' {
+		case '{':
+			if !inString {
 				braceCount++
-			} else if char == '}' {
+			}
+		case '}':
+			if !inString {
 				braceCount--
 				if braceCount == 0 {
 					return data[:i+1]
@@ -770,38 +617,54 @@ func (c *Client) extractCompleteJSON(data string) string {
 	return ""
 }
 
-func isLineEnd(line []byte) bool {
-	return bytes.Equal(line, []byte("\n")) || bytes.Equal(line, []byte("\r\n"))
+func determineBedrockEventType(cleanData string, jsonObj map[string]interface{}) string {
+	// First try to determine from the event data itself
+	eventTypes := []string{"contentBlockDelta", "messageStart", "messageStop", "contentBlockStop", "metadata"}
+	for _, eventType := range eventTypes {
+		if strings.Contains(cleanData, eventType) {
+			return eventType
+		}
+	}
+
+	// Fallback to JSON content analysis
+	if _, ok := jsonObj["delta"]; ok {
+		return "contentBlockDelta"
+	}
+	if _, ok := jsonObj["role"]; ok {
+		return "messageStart"
+	}
+	if _, ok := jsonObj["stopReason"]; ok {
+		return "messageStop"
+	}
+	if _, ok := jsonObj["metrics"]; ok {
+		return "metadata"
+	}
+
+	return "message"
 }
 
-// Wrap the raw HTTPResponse we received to a sse.HTTPResponse we can pass to the user
 func (c *Client) wrapHTTPResponse(errMessage string) *HTTPResponse {
-	sseResponse := &HTTPResponse{}
-
 	if errMessage != "" {
-		sseResponse.Error = errMessage
-		return sseResponse
+		return &HTTPResponse{Error: errMessage}
 	}
 
-	// Make sure we have a valid response
 	if c.resp == nil {
-		sseResponse.Error = "No HTTP response available"
-		return sseResponse
+		return &HTTPResponse{Error: "No HTTP response available"}
 	}
 
-	sseResponse.URL = c.url
-	sseResponse.Status = c.resp.StatusCode
-	sseResponse.Headers = make(map[string]string, len(c.resp.Header))
-
+	headers := make(map[string]string, len(c.resp.Header))
 	for k, vs := range c.resp.Header {
-		sseResponse.Headers[k] = strings.Join(vs, ", ")
+		headers[k] = strings.Join(vs, ", ")
 	}
 
-	return sseResponse
+	return &HTTPResponse{
+		URL:     c.url,
+		Status:  c.resp.StatusCode,
+		Headers: headers,
+	}
 }
 
 func parseConnectArgs(state *lib.State, rt *sobek.Runtime, args ...sobek.Value) (*sseOpenArgs, error) {
-	// The params argument is optional
 	var callableV, paramsV sobek.Value
 	switch len(args) {
 	case 2:
@@ -813,7 +676,7 @@ func parseConnectArgs(state *lib.State, rt *sobek.Runtime, args ...sobek.Value) 
 	default:
 		return nil, errors.New("invalid number of arguments to sse.open")
 	}
-	// Get the callable (required)
+
 	setupFn, isFunc := sobek.AssertFunction(callableV)
 	if !isFunc {
 		return nil, errors.New("last argument to sse.open must be a function")
@@ -827,54 +690,45 @@ func parseConnectArgs(state *lib.State, rt *sobek.Runtime, args ...sobek.Value) 
 		headers:      headers,
 		cookieJar:    state.CookieJar,
 		tagsAndMeta:  &tagsAndMeta,
-		streamFormat: "sse", // default to SSE
+		streamFormat: "sse",
 	}
 
 	if sobek.IsUndefined(paramsV) || sobek.IsNull(paramsV) {
 		return parsedArgs, nil
 	}
 
-	// Parse the optional second argument (params)
 	params := paramsV.ToObject(rt)
 	for _, k := range params.Keys() {
 		switch k {
 		case "headers":
-			headersV := params.Get(k)
-			if sobek.IsUndefined(headersV) || sobek.IsNull(headersV) {
-				continue
-			}
-			headersObj := headersV.ToObject(rt)
-			if headersObj == nil {
-				continue
-			}
-			for _, key := range headersObj.Keys() {
-				parsedArgs.headers.Set(key, headersObj.Get(key).String())
+			if headersV := params.Get(k); !sobek.IsUndefined(headersV) && !sobek.IsNull(headersV) {
+				if headersObj := headersV.ToObject(rt); headersObj != nil {
+					for _, key := range headersObj.Keys() {
+						parsedArgs.headers.Set(key, headersObj.Get(key).String())
+					}
+				}
 			}
 		case "tags":
 			if err := common.ApplyCustomUserTags(rt, parsedArgs.tagsAndMeta, params.Get(k)); err != nil {
 				return nil, fmt.Errorf("invalid sse.open() metric tags: %w", err)
 			}
 		case "jar":
-			jarV := params.Get(k)
-			if sobek.IsUndefined(jarV) || sobek.IsNull(jarV) {
-				continue
-			}
-			if v, ok := jarV.Export().(*httpModule.CookieJar); ok {
-				parsedArgs.cookieJar = v.Jar
+			if jarV := params.Get(k); !sobek.IsUndefined(jarV) && !sobek.IsNull(jarV) {
+				if v, ok := jarV.Export().(*httpModule.CookieJar); ok {
+					parsedArgs.cookieJar = v.Jar
+				}
 			}
 		case "method":
 			parsedArgs.method = strings.TrimSpace(params.Get(k).ToString().String())
 		case "body":
 			parsedArgs.body = strings.TrimSpace(params.Get(k).ToString().String())
 		case "streamFormat":
-			format := params.Get(k).String()
-			if format == "bedrock" || format == "json" {
+			if format := params.Get(k).String(); format == "bedrock" {
 				parsedArgs.streamFormat = format
 			}
 		}
 	}
 
-	fmt.Printf("DEBUG: Final streamFormat: %s\n", parsedArgs.streamFormat)
 	return parsedArgs, nil
 }
 
@@ -884,4 +738,8 @@ func hasPrefix(s []byte, prefix string) bool {
 
 func stripPrefix(line []byte, start int) string {
 	return string(line[start : len(line)-1])
+}
+
+func isLineEnd(line []byte) bool {
+	return bytes.Equal(line, []byte("\n")) || bytes.Equal(line, []byte("\r\n"))
 }
