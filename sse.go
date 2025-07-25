@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -64,7 +65,6 @@ type HTTPResponse struct {
 	URL     string            `json:"url"`
 	Status  int               `json:"status"`
 	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body"`
 	Error   string            `json:"error"`
 }
 
@@ -77,12 +77,13 @@ type Event struct {
 }
 
 type sseOpenArgs struct {
-	setupFn     sobek.Callable
-	headers     http.Header
-	method      string
-	body        string
-	cookieJar   *cookiejar.Jar
-	tagsAndMeta *metrics.TagsAndMeta
+	setupFn      sobek.Callable
+	headers      http.Header
+	method       string
+	body         string
+	cookieJar    *cookiejar.Jar
+	tagsAndMeta  *metrics.TagsAndMeta
+	streamFormat string
 }
 
 // Exports returns the exports of the sse module.
@@ -117,7 +118,8 @@ func (mi *sse) Open(url string, args ...sobek.Value) (*HTTPResponse, error) {
 		return client.wrapHTTPResponse(err.Error()), nil
 	}
 
-	if !strings.Contains(client.resp.Header.Get("Content-Type"), "text/event-stream") {
+	if !strings.Contains(client.resp.Header.Get("Content-Type"), "text/event-stream") &&
+		parsedArgs.streamFormat != "bedrock" {
 		// Non-SSE response, wrap it and return immediately
 		return client.wrapHTTPResponse(""), nil
 	}
@@ -135,11 +137,14 @@ func (mi *sse) Open(url string, args ...sobek.Value) (*HTTPResponse, error) {
 	readErrChan := make(chan error)
 	readCloseChan := make(chan int)
 
-	// Wraps a couple of channels
-	go client.readEvents(readEventChan, readErrChan, readCloseChan)
+	// Choose parser based on streamFormat
+	if parsedArgs.streamFormat == "bedrock" {
+		go client.readBedrockEvents(readEventChan, readErrChan, readCloseChan)
+	} else {
+		go client.readEvents(readEventChan, readErrChan, readCloseChan)
+	}
 
-	// This is the main control loop. All JS code (including error handlers)
-	// should only be executed by this thread to avoid race conditions
+	// Main event loop
 	for {
 		select {
 		case event := <-readEventChan:
@@ -159,15 +164,12 @@ func (mi *sse) Open(url string, args ...sobek.Value) (*HTTPResponse, error) {
 			client.handleEvent("error", rt.ToValue(readErr))
 
 		case <-ctx.Done():
-			// VU is shutting down during an interrupt
-			// client events will not be forwarded to the VU
 			_ = client.closeResponseBody()
 
 		case <-readCloseChan:
 			_ = client.closeResponseBody()
 
 		case <-client.done:
-			// This is the final exit point normally triggered by closeResponseBody
 			return client.wrapHTTPResponse(""), nil
 		}
 	}
@@ -441,44 +443,228 @@ func (c *Client) readEvents(readChan chan Event, errorChan chan error, closeChan
 	}
 }
 
-func isLineEnd(line []byte) bool {
-	return bytes.Equal(line, []byte("\n")) || bytes.Equal(line, []byte("\r\n"))
+// Handle AWS Bedrock's binary event stream format
+func (c *Client) readBedrockEvents(readChan chan Event, errorChan chan error, closeChan chan int) {
+	reader := bufio.NewReader(c.resp.Body)
+	var buffer bytes.Buffer
+
+	for {
+		// Read more data into buffer
+		chunk := make([]byte, 4096)
+		n, err := reader.Read(chunk)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if buffer.Len() > 0 {
+					c.processBedrockBuffer(buffer.Bytes(), readChan)
+				}
+				select {
+				case closeChan <- -1:
+					return
+				case <-c.done:
+					return
+				}
+			} else {
+				select {
+				case errorChan <- err:
+					return
+				case <-c.done:
+					return
+				}
+			}
+		}
+
+		buffer.Write(chunk[:n])
+		remaining := c.processBedrockBuffer(buffer.Bytes(), readChan)
+		buffer.Reset()
+		if len(remaining) > 0 {
+			buffer.Write(remaining)
+		}
+	}
 }
 
-// Wrap the raw HTTPResponse we received to a sse.HTTPResponse we can pass to the user
+func (c *Client) processBedrockBuffer(data []byte, readChan chan Event) []byte {
+	dataStr := string(data)
+	events, remaining := c.findBedrockEvents(dataStr)
+
+	for _, eventData := range events {
+		if ev := c.parseBedrockEvent(eventData); ev != nil {
+			select {
+			case readChan <- *ev:
+			case <-c.done:
+				return []byte(remaining)
+			}
+		}
+	}
+
+	return []byte(remaining)
+}
+
+func (c *Client) findBedrockEvents(data string) ([]string, string) {
+	eventMarker := ":event-type"
+	var events []string
+	var indices []int
+
+	// Find all event markers
+	for pos := 0; pos < len(data); {
+		if idx := strings.Index(data[pos:], eventMarker); idx != -1 {
+			indices = append(indices, pos+idx)
+			pos += idx + len(eventMarker)
+		} else {
+			break
+		}
+	}
+
+	if len(indices) == 0 {
+		return nil, data
+	}
+
+	// Extract complete events
+	for i := 0; i < len(indices)-1; i++ {
+		eventData := data[indices[i]:indices[i+1]]
+		if strings.TrimSpace(eventData) != "" {
+			events = append(events, eventData)
+		}
+	}
+
+	// Handle the last event
+	lastEventData := data[indices[len(indices)-1]:]
+	if c.isBedrockEventComplete(lastEventData) {
+		events = append(events, lastEventData)
+		return events, ""
+	}
+
+	return events, lastEventData
+}
+
+func (c *Client) isBedrockEventComplete(eventData string) bool {
+	cleanData := cleanNonPrintable(eventData)
+	if jsonStart := strings.Index(cleanData, "{"); jsonStart != -1 {
+		return extractCompleteJSON(cleanData[jsonStart:]) != ""
+	}
+	return false
+}
+
+func (c *Client) parseBedrockEvent(eventData string) *Event {
+	cleanData := cleanNonPrintable(eventData)
+	cleanData = strings.Join(strings.Fields(cleanData), " ")
+
+	// Extract JSON
+	jsonStart := strings.Index(cleanData, "{")
+	if jsonStart == -1 {
+		return nil
+	}
+
+	jsonData := extractCompleteJSON(cleanData[jsonStart:])
+	if jsonData == "" {
+		return nil
+	}
+
+	// Validate JSON
+	var jsonObj map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonData), &jsonObj); err != nil {
+		return nil
+	}
+
+	// Determine event type
+	eventType := determineBedrockEventType(cleanData, jsonObj)
+
+	return &Event{
+		Name: eventType,
+		Data: jsonData,
+	}
+}
+
+// Helper functions
+func cleanNonPrintable(data string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 32 && r <= 126) || r >= 0x80 {
+			return r
+		}
+		return ' '
+	}, data)
+}
+
+func extractCompleteJSON(data string) string {
+	braceCount := 0
+	inString := false
+	escaped := false
+
+	for i, char := range data {
+		if escaped {
+			escaped = false
+			continue
+		}
+
+		switch char {
+		case '\\':
+			escaped = true
+		case '"':
+			inString = !inString
+		case '{':
+			if !inString {
+				braceCount++
+			}
+		case '}':
+			if !inString {
+				braceCount--
+				if braceCount == 0 {
+					return data[:i+1]
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+func determineBedrockEventType(cleanData string, jsonObj map[string]interface{}) string {
+	// First try to determine from the event data itself
+	eventTypes := []string{"contentBlockDelta", "messageStart", "messageStop", "contentBlockStop", "metadata"}
+	for _, eventType := range eventTypes {
+		if strings.Contains(cleanData, eventType) {
+			return eventType
+		}
+	}
+
+	// Fallback to JSON content analysis
+	if _, ok := jsonObj["delta"]; ok {
+		return "contentBlockDelta"
+	}
+	if _, ok := jsonObj["role"]; ok {
+		return "messageStart"
+	}
+	if _, ok := jsonObj["stopReason"]; ok {
+		return "messageStop"
+	}
+	if _, ok := jsonObj["metrics"]; ok {
+		return "metadata"
+	}
+
+	return "message"
+}
+
 func (c *Client) wrapHTTPResponse(errMessage string) *HTTPResponse {
 	if errMessage != "" {
-		// Read the response body if available.
-		bodyBytes, err := io.ReadAll(c.resp.Body)
-		if err != nil {
-			bodyBytes = []byte("Error reading body: " + err.Error())
-		}
-		return &HTTPResponse{Error: errMessage, Body: string(bodyBytes)}
-	}
-	sseResponse := HTTPResponse{
-		URL:    c.url,
-		Status: c.resp.StatusCode,
+		return &HTTPResponse{Error: errMessage}
 	}
 
-	sseResponse.Headers = make(map[string]string, len(c.resp.Header))
+	if c.resp == nil {
+		return &HTTPResponse{Error: "No HTTP response available"}
+	}
+
+	headers := make(map[string]string, len(c.resp.Header))
 	for k, vs := range c.resp.Header {
-		sseResponse.Headers[k] = strings.Join(vs, ", ")
+		headers[k] = strings.Join(vs, ", ")
 	}
 
-	// Only read the body if the content type is not `text/event-stream`.
-	if !strings.Contains(c.resp.Header.Get("Content-Type"), "text/event-stream") {
-		bodyBytes, err := io.ReadAll(c.resp.Body)
-		if err != nil {
-			return nil
-		}
-		sseResponse.Body = string(bodyBytes)
+	return &HTTPResponse{
+		URL:     c.url,
+		Status:  c.resp.StatusCode,
+		Headers: headers,
 	}
-
-	return &sseResponse
 }
 
 func parseConnectArgs(state *lib.State, rt *sobek.Runtime, args ...sobek.Value) (*sseOpenArgs, error) {
-	// The params argument is optional
 	var callableV, paramsV sobek.Value
 	switch len(args) {
 	case 2:
@@ -490,7 +676,7 @@ func parseConnectArgs(state *lib.State, rt *sobek.Runtime, args ...sobek.Value) 
 	default:
 		return nil, errors.New("invalid number of arguments to sse.open")
 	}
-	// Get the callable (required)
+
 	setupFn, isFunc := sobek.AssertFunction(callableV)
 	if !isFunc {
 		return nil, errors.New("last argument to sse.open must be a function")
@@ -500,48 +686,46 @@ func parseConnectArgs(state *lib.State, rt *sobek.Runtime, args ...sobek.Value) 
 	headers.Set("User-Agent", state.Options.UserAgent.String)
 	tagsAndMeta := state.Tags.GetCurrentValues()
 	parsedArgs := &sseOpenArgs{
-		setupFn:     setupFn,
-		headers:     headers,
-		cookieJar:   state.CookieJar,
-		tagsAndMeta: &tagsAndMeta,
+		setupFn:      setupFn,
+		headers:      headers,
+		cookieJar:    state.CookieJar,
+		tagsAndMeta:  &tagsAndMeta,
+		streamFormat: "sse",
 	}
 
 	if sobek.IsUndefined(paramsV) || sobek.IsNull(paramsV) {
 		return parsedArgs, nil
 	}
 
-	// Parse the optional second argument (params)
 	params := paramsV.ToObject(rt)
 	for _, k := range params.Keys() {
 		switch k {
 		case "headers":
-			headersV := params.Get(k)
-			if sobek.IsUndefined(headersV) || sobek.IsNull(headersV) {
-				continue
-			}
-			headersObj := headersV.ToObject(rt)
-			if headersObj == nil {
-				continue
-			}
-			for _, key := range headersObj.Keys() {
-				parsedArgs.headers.Set(key, headersObj.Get(key).String())
+			if headersV := params.Get(k); !sobek.IsUndefined(headersV) && !sobek.IsNull(headersV) {
+				if headersObj := headersV.ToObject(rt); headersObj != nil {
+					for _, key := range headersObj.Keys() {
+						parsedArgs.headers.Set(key, headersObj.Get(key).String())
+					}
+				}
 			}
 		case "tags":
 			if err := common.ApplyCustomUserTags(rt, parsedArgs.tagsAndMeta, params.Get(k)); err != nil {
 				return nil, fmt.Errorf("invalid sse.open() metric tags: %w", err)
 			}
 		case "jar":
-			jarV := params.Get(k)
-			if sobek.IsUndefined(jarV) || sobek.IsNull(jarV) {
-				continue
-			}
-			if v, ok := jarV.Export().(*httpModule.CookieJar); ok {
-				parsedArgs.cookieJar = v.Jar
+			if jarV := params.Get(k); !sobek.IsUndefined(jarV) && !sobek.IsNull(jarV) {
+				if v, ok := jarV.Export().(*httpModule.CookieJar); ok {
+					parsedArgs.cookieJar = v.Jar
+				}
 			}
 		case "method":
 			parsedArgs.method = strings.TrimSpace(params.Get(k).ToString().String())
 		case "body":
 			parsedArgs.body = strings.TrimSpace(params.Get(k).ToString().String())
+		case "streamFormat":
+			if format := params.Get(k).String(); format == "bedrock" {
+				parsedArgs.streamFormat = format
+			}
 		}
 	}
 
@@ -554,4 +738,8 @@ func hasPrefix(s []byte, prefix string) bool {
 
 func stripPrefix(line []byte, start int) string {
 	return string(line[start : len(line)-1])
+}
+
+func isLineEnd(line []byte) bool {
+	return bytes.Equal(line, []byte("\n")) || bytes.Equal(line, []byte("\r\n"))
 }
