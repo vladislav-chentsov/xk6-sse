@@ -25,7 +25,7 @@ go install go.k6.io/xk6/cmd/xk6@latest
 2. Build the binary:
 
 ```shell
-xk6 build --with github.com/phymbert/xk6-sse@latest
+xk6 build --with github.com/vladislav-chentsov/xk6-sse@latest
 ```
 
 ## Examples

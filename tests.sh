@@ -2,7 +2,7 @@
 
 set -eux
 
-xk6 build --with github.com/phymbert/xk6-sse=.
+xk6 build --with github.com/vladislav-chentsov/xk6-sse=.
 for script in examples/*.js
 do
   if [ $script == "examples/llm.js" ]; then
