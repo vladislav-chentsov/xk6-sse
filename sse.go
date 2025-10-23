@@ -67,6 +67,7 @@ type HTTPResponse struct {
 	Status  int               `json:"status"`
 	Headers map[string]string `json:"headers"`
 	Error   string            `json:"error"`
+	Body    string            `json:"body"`
 }
 
 // Event represents a Server-Sent Event
@@ -78,13 +79,13 @@ type Event struct {
 }
 
 type sseOpenArgs struct {
-	setupFn     sobek.Callable
-	headers     http.Header
-	method      string
-	body        string
-	cookieJar   *cookiejar.Jar
-	tagsAndMeta *metrics.TagsAndMeta
-	timeout     time.Duration
+	setupFn      sobek.Callable
+	headers      http.Header
+	method       string
+	body         string
+	cookieJar    *cookiejar.Jar
+	tagsAndMeta  *metrics.TagsAndMeta
+	timeout      time.Duration
 	streamFormat string
 }
 
@@ -665,11 +666,36 @@ func (c *Client) wrapHTTPResponse(errMessage string) *HTTPResponse {
 		headers[k] = strings.Join(vs, ", ")
 	}
 
-	return &HTTPResponse{
+	// Default response without body
+	resp := &HTTPResponse{
 		URL:     c.url,
 		Status:  c.resp.StatusCode,
 		Headers: headers,
 	}
+
+	// If this isn't an SSE stream, try to read and include the body for diagnostics.
+	// We consider it non-SSE when Content-Type doesn't include text/event-stream.
+	contentType := c.resp.Header.Get("Content-Type")
+	if !strings.Contains(contentType, "text/event-stream") {
+		fmt.Println("Content-Type is not text/event-stream")
+		// Read up to a reasonable cap to avoid unbounded memory usage.
+		// 256KB should be sufficient for typical error payloads.
+		const maxBody = 256 * 1024
+		var buf bytes.Buffer
+		limited := io.LimitedReader{R: c.resp.Body, N: maxBody + 1}
+		_, _ = io.Copy(&buf, &limited)
+
+		// Close since we're consuming the body here
+		_ = c.closeResponseBody()
+
+		body := buf.Bytes()
+		if len(body) > maxBody {
+			body = body[:maxBody]
+		}
+		resp.Body = string(body)
+	}
+
+	return resp
 }
 
 func parseConnectArgs(state *lib.State, rt *sobek.Runtime, args ...sobek.Value) (*sseOpenArgs, error) {
