@@ -121,8 +121,22 @@ func (mi *sse) Open(url string, args ...sobek.Value) (*HTTPResponse, error) {
 		return client.wrapHTTPResponse(err.Error()), nil
 	}
 
-	if !strings.Contains(client.resp.Header.Get("Content-Type"), "text/event-stream") &&
-		parsedArgs.streamFormat != "bedrock" {
+	// Validate if the response is actually a stream
+	contentType := client.resp.Header.Get("Content-Type")
+	isBedrock := parsedArgs.streamFormat == "bedrock"
+	isValidStream := false
+
+	if isBedrock {
+		// Bedrock streams must have this specific content type
+		isValidStream = strings.Contains(contentType, "application/vnd.amazon.eventstream")
+	} else {
+		// Standard SSE
+		isValidStream = strings.Contains(contentType, "text/event-stream")
+	}
+
+	// If it is not a valid stream OR if we have an error status (even if content-type matched),
+	// we should treat it as a standard HTTP response and not try to parse streams.
+	if !isValidStream || client.resp.StatusCode >= 400 {
 		// Non-SSE response, wrap it and return immediately
 		return client.wrapHTTPResponse(""), nil
 	}
@@ -674,10 +688,12 @@ func (c *Client) wrapHTTPResponse(errMessage string) *HTTPResponse {
 	}
 
 	// If this isn't an SSE stream, try to read and include the body for diagnostics.
-	// We consider it non-SSE when Content-Type doesn't include text/event-stream.
+	// We consider it non-SSE when Content-Type doesn't include text/event-stream OR application/vnd.amazon.eventstream.
 	contentType := c.resp.Header.Get("Content-Type")
-	if !strings.Contains(contentType, "text/event-stream") {
-		fmt.Println("Content-Type is not text/event-stream")
+	isStream := strings.Contains(contentType, "text/event-stream") ||
+		strings.Contains(contentType, "application/vnd.amazon.eventstream")
+
+	if !isStream {
 		// Read up to a reasonable cap to avoid unbounded memory usage.
 		// 256KB should be sufficient for typical error payloads.
 		const maxBody = 256 * 1024
